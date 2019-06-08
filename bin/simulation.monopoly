@@ -1,0 +1,618 @@
+#! /usr/bin/env python
+
+import os,sys
+from random import choice, uniform
+from itertools import groupby
+
+import logging
+log = logging.getLogger()
+
+def dollars( px ):
+    return round(px,2)
+
+def street_value( cards ):
+    print(  cards )
+    return reduce( lambda c1,c2: c1+c2, map(lambda c: c.price, cards), 0 )
+
+class Dice(object):
+    def __init__(self):
+        self.history = []
+    def roll(self):
+        d1 = choice(range(6)) + 1 
+        d2 = choice(range(6)) + 1
+        self.history.append( (d1,d2,) )
+        print( "DICE %s %s"%( d1, d2 ) )
+        return d1+d2
+    def isDouble(self):
+        return self.history[-1][0]==self.history[-1][1]
+    def isThirdDouble(self):
+        return all( map(lambda t: t[0]==t[1], self.history[-3:]) )
+
+class Block(object):
+    def __init__(self, color_desc,upgrade_price):
+        self.color = color_desc
+        self.spaces = []
+        self.upgrade_price = upgrade_price
+    def __eq__(self,other):
+        return type(other)==Block and self.color == other.color
+    def __repr__(self):
+        return "%s block (len %s)"%(self.color,len(self.spaces))
+    def __len__(self):
+        return len(self.spaces)
+    def add(self,space):
+        self.spaces.append(space)
+    def isMonopolized(self):
+        g = map( lambda c:c.owner, self.spaces )
+        last_o = g[0]
+        for o in g:
+            if o is None or o != last_o:
+                return False
+            last_o = o
+        return True
+
+class Bank(object):
+    def __init__(self):
+        self.outflow = 0
+        self.inflow = 0
+        self.mortgages = []
+    def __str__(self):
+        return "Bank of America (%s)"%( self.stats() )
+    def withdraw(self,amount):
+        self.outflow += amount
+        return amount
+    def deposit(self,amount):
+        self.inflow += amount
+        return amount
+    def addCard(self,card):
+        pass
+    def isMortgaged(self,card):
+        try:
+            idx = self.mortgages.index(card)
+            return True
+        except ValueError as e:
+            return False
+    def mortgage(self,card):
+        self.mortgages.append(card)
+        return self.withdraw(card.price/2)
+    def payoff(self,board,player,card):
+        idx = self.mortgages.index(card)
+        del self.mortgages[idx]
+        px = (card.price/2)*1.1
+        paid = player.pay(board,self,px)
+    def stats(self):
+        return "Outflow %s, Inflow %s, Float %s"%( self.outflow, self.inflow, self.outflow-self.inflow )
+
+class Player(object):
+    def __init__(self,name):
+        self.name = name
+        self.money = 0
+        self.cards = []
+        self.spot = 0
+        self.in_jail = False
+    def __repr__(self):
+        return '%s $(%s,assets %s,cash %s) %s'%(self.name,self.net_worth(),self.net_assests(),self.money,self.cards)
+    def put(self,position,board):
+        self.spot = position
+        self.board = board
+    def give(self,money):
+        self.money+=money
+    def move(self,board,places):
+        distance_to_go = len(self.board) - self.position()
+        self.spot += places
+        return places>=distance_to_go
+    def pre_action(self,board):
+        pass
+    def post_action(self,board):
+        pass
+    def proposals(self,board):
+        raise StopIteration()
+    def position(self):
+        return self.spot % len(self.board.places)
+    def place(self):
+        return self.board[ self.position() ]
+    def deposit(self,v):
+        self.money += v
+
+    def net_assests(self):
+        value = sum( [ c.price for c in self.cards ] )
+        return value
+    def net_worth(self):
+        value = sum( [ c.price for c in self.cards ] ) + self.money
+        value += sum( [ (c.block.upgrade_price/2)*c.upgrades for c in self.cards ] )
+        return value
+
+    def pay(self,board,target,charge):
+        payment = self.money if charge > self.money else charge
+        target.deposit(payment)
+        self.money -= charge
+        
+        if payment < charge:
+            balance = charge-payment
+            additional_capital = self.liquidate(board, balance )
+            if additional_capital >= balance:
+                target.deposit(balance)
+                payment += balance
+            else:
+                self.bankrupt(board,target)
+
+        print( "%s paid %s to %s!!!!"%( self.name, charge, target ) )
+        return payment
+
+    def evalulateContract(self,contract):
+        return True
+
+    def liquidate(self,board,amount):
+        liquid = 0
+        return liquid
+
+    def bankrupt(self,board,player):
+        for c in self.cards:
+            c.owner = None
+            player.addCard(c)
+        self.cards = []
+        print( board )
+        idx = board.players.index(self)
+        del board.players[idx]
+    def getMonopolies(self):
+        blks = set( map( lambda x:x.block, self.cards ) )
+        return [ b for b in blks if b.isMonopolized() ]
+    def canBuy(self,card):
+        if self.money >= card.price:
+            return True
+    def addCard(self,card):
+        self.cards.append(card)
+        card.owner = self
+    def dropCard(self,c):
+        idx = self.cards.index(c)
+        c = self.cards[idx]
+        del self.cards[idx]
+        c.owner = None
+
+class Board(object):
+    def __init__(self):
+        self.places = []
+        self.bank = Bank()
+        self.dice = Dice()
+        self.players = []
+    def add(self,card):
+        self.places.append(card)
+    def getPlayer(self,n):
+        if not len(self.players):
+            raise StopIteration()
+        return self.players[ n%len(self.players) ]
+    def addPlayer(self,player):
+        player.give(self.bank.withdraw(1500))
+        player.put(0,self)
+        self.players.append( player )
+    def getPlayers(self,spot):
+        return [ p for p in self.players if (p.position()==spot) ]
+    def getBlock(self,blk):
+        return [ p for p in self.places if p.block==blk ]
+    def getMonopolies(self):
+        blocks = groupby( self.places , lambda c:c.block )
+        return [ b for b in blocks if b.isMonopolized() ]
+    def __getitem__(self,v):
+        assert(type(v)==int)
+        return self.places[ v %len(self.places) ]
+    def __str__(self):
+        out = "Bank: %s\n"%self.bank
+        for i in xrange(len(self.places)):
+            s = self.places[i]
+            out += "%s %s\n"%( s, self.getPlayers(i) )
+        return out
+    def __len__(self):
+        return len(self.places)
+
+class Card(object):
+    def __init__(self):
+        self.name = type(self)
+        self.owner = None
+        self.block = None
+        self.income = 0
+    def __repr__(self):
+        return "%s"%(self.name)
+    def __str__(self):
+        return "%-40s %-20s %-10s"%(self.getName(),self.getOwnerName(),self.income)
+    def action(self,board,player):
+        raise RuntimeError("Not yet implemented")
+    def getName(self):
+        return self.name
+    def getStatus(self):
+        return "%s income=%s"%( self.getOwnerName(), self.income )
+    def getOwnerName(self):
+        return "owned by %s"%( self.owner.name ) if self.owner else "available"
+    def rent(self,board):
+        return 0
+
+class Property(Card):
+    def __init__(self,name,block,price,schedule):
+        super(Property,self).__init__()
+        self.name = name
+        self.price = price
+        self.schedule = schedule
+        self.block = block
+        block.add(self)
+        self.upgrades = 0
+        self.owner = None
+    def __repr__(self):
+        return "%s"%(self.name)
+    def getName(self):
+        return "%s %s"%(self.name,self.describeUpgrades())
+    def __lt__(self,other):
+        return self.price < other.price
+    def __le__(self,other):
+        return self.price <= other.price
+    def __eq__(self,other):
+        return self.price == other.price
+    def __ne__(self,other):
+        return self.price != other.price
+    def __gt__(self,other):
+        return self.price > other.price
+    def __ge__(self,other):
+        return self.price >= other.price
+    def upgrade(self):
+        self.upgrades+=1
+    def downgrade(self):
+        self.upgrades-=1
+    def action(self,board,player):
+        if self.owner and player != self.owner:
+            owed = self.rent(board)
+            player.pay( board, self.owner, owed )
+        elif self.owner is None and player.canBuy(self):
+            player.pay( board, board.bank, self.price )
+            player.addCard(self)
+    def rent(self,board):
+        block = [k for k in board.places if k.block==self.block]
+        multiplier = 1
+        if self.block.isMonopolized() and self.upgrades == 0:
+            multiplier = 2
+        x = (self.schedule[self.upgrades]*multiplier) if self.schedule else 0
+        self.income += x
+        return x
+    def canUpgrade(self):
+        return self.upgrades < 5 and self.isMonopolized()
+    def isMonopolized(self):
+        return self.block.isMonopolized()
+    def describeUpgrades(self):
+        if self.upgrades==5:
+            return "hotel"
+        if self.upgrades>=1:
+            return "%s houses" %self.upgrades
+        return ""
+
+class RailRoad(Property):
+    blk = Block("RailRoads",0)
+    def __init__(self,name):
+        super(RailRoad,self).__init__(name,RailRoad.blk,200,None)
+    def canUpgrade(self):
+        return False
+    def rent(self,board):
+        group = [k for k in board.places if type(k)==RailRoad]
+        num = len(filter(lambda c:c.owner==self.owner, group))
+        if num == 1:
+            x = 25
+        elif num == 2:
+            x = 50
+        elif num == 3:
+            x = 100
+        elif num == 4:
+            x = 200
+        self.income += x
+        return x
+
+class Utility(Property):
+    blk = Block("Utilities",0)
+    def __init__(self,name):
+        super(Utility,self).__init__(name,Utility.blk,150,None)
+    def canUpgrade(self):
+        return False
+    def rent(self,board):
+        group = [k for k in board.places if type(k)==Utility]
+        num = len(filter(lambda c:c.owner==self.owner, group))
+        if num == 1:
+            x = sum(board.dice.history[-1])*4
+        elif num == 2:
+            x = sum(board.dice.history[-1])*10
+        self.income += x
+        return x
+
+
+class Go(Card):
+    def action(self,board,player):
+        pass
+class IncomeTax(Card):
+    def action(self,board,player):
+        self.income += player.pay( board, board.bank, 75 )
+
+class LuxuryTax(Card):
+    def action(self,board,player):
+        self.income += player.pay( board, board.bank, 150 )
+class Chance(Card):
+    def action(self,board,player):
+        pass
+class CommunityChest(Card):
+    def action(self,board,player):
+        pass
+class FreeParking(Card):
+    def action(self,board,player):
+        pass
+class Jail(Card):
+    def action(self,board,player):
+        pass
+class GoToJail(Card):
+    def action(self,board,player):
+        pass
+
+def setup():
+    bd = Board()
+    b = Block("Brown (Dark Purple)",50)
+    bd.add(Go())
+    bd.add(Property("Mediterranean Avenue",b,60,[2,10,30,90,160,250]))
+    bd.add(CommunityChest())
+    bd.add(Property("Baltic Avenue",b,60,[4,20,60,180,320,450]))
+    bd.add(IncomeTax())
+    bd.add(RailRoad("Reading RailRoad") )
+
+    b = Block("Light Blue",50)
+    bd.add(Property("Oriental Avenue",b,100,[6,30,90,270,400,550]))
+    bd.add(Chance())
+    bd.add(Property("Vermont Avenue",b,100,[6,30,90,270,400,550]))
+    bd.add(Property("Connecticut Avenue",b,120,[8,40,100,300,450,600]))
+    bd.add(Jail())
+
+    b = Block("Pink",100)
+    bd.add(Property("St. Charles Place",b,140,[10,50,150,450,625,750]))
+    bd.add(Utility("Electric Company"))
+    bd.add(Property("States Avenue",b,140,[10,50,150,450,625,750]))
+    bd.add(Property("Virginia Avenue",b,160,[12,60,180,500,700,900]))
+    bd.add(RailRoad("Pennsylvania Railroad") )
+
+    b = Block("Orange",100)
+    bd.add(Property("St. James Place",b,180,[14,70,200,550,750,950]))
+    bd.add(CommunityChest())
+    bd.add(Property("Tennessee Avenue",b,180,[14,70,200,550,750,950]))
+    bd.add(Property("New York Avenue",b,200,[16,80,220,600,800,1000]))
+    bd.add(FreeParking())
+
+    b = Block("Red",150)
+    bd.add(Property("Kentucky Avenue",b,220,[18,90,250,700,875,1050]))
+    bd.add(Chance())
+    bd.add(Property("Indiana Avenue",b,220,[18,90,250,700,875,1050]))
+    bd.add(Property("Illinois Avenue",b,240,[20,100,300,750,925,1100]))
+    bd.add(RailRoad("B. & O. Railroad"))
+
+    b = Block("Yellow",150)
+    bd.add(Property("Atlantic Avenue",b,260,[22,110,330,800,975,1150]))
+    bd.add(Property("Ventnor Avenue",b,260,[22,110,330,800,975,1150]))
+    bd.add(Utility("Water works"))
+    bd.add(Property("Marvin Gardens",b,280,[24,120,360,850,1025,1200]))
+    bd.add(GoToJail())
+
+    b = Block("Green",200)
+    bd.add(Property("Pacific Avenue",b,300,[26,130,390,900,1100,1275]))
+    bd.add(Property("North Carolina Avenue",b,300,[26,130,390,900,1100,1275]))
+    bd.add(CommunityChest())
+    bd.add(Property("Pennsylvania Avenue",b,320,[28,150,450,1000,1400]))
+    bd.add(RailRoad("Short Line"))
+    bd.add(Chance())
+
+    b = Block("Dark Blue",200)
+    bd.add(Property("Park Place",b,350,[35,35,175,500,1100,1300,1500]))
+    bd.add(LuxuryTax())
+    bd.add(Property("Boardwalk",b,400,[50,200,600,1400,1700,2000]))
+
+    return bd
+
+class Monopoly(object):
+    def __init__(self,board):
+        self.board = board
+        self.player = 0
+        self.turns = 0
+
+    def getNextPlayer(self):
+        x = self.player
+        self.player += 1
+        return self.board.getPlayer(x)
+
+    def turn(self):
+        p = self.getNextPlayer()
+        p.pre_action(self.board)
+        for contract in p.proposals(self.board):
+            if contract.getTarget().evalulateContract( contract ):
+                contract.execute( self.board )
+        x = self.board.dice.roll()
+        if p.move( self.board, x):
+            print( "%s PASSED GO!" % p )
+            self.board.places[0].income-=200
+            p.deposit( self.board.bank.withdraw(200) )
+        c = p.place()
+        print( "turn %s: %s landed on %s!"%( self.turns, p, c ) )
+        c.action( self.board, p )
+        p.post_action(self.board)
+        if len(self.board.players)==1:
+            print( "Winner %s in %s turns" %( self.board.players[0], self.turns ) )
+            raise StopIteration()
+        self.turns += 1
+
+class Contract(object):
+    def __init__(self):
+        self.target = None
+    def execute(self,board):
+        pass
+
+class CashPurchaseContract(Contract):
+    def __init__(self, solicitor, target, items, cash):
+        self._solicitor = solicitor
+        self._target = target
+        self._items = items
+        self._cash = cash
+        self._accepted = False
+
+        if self._cash > self._solicitor.money:
+            raise RuntimeError( "CashPurchaseContract: %s exceeds %s's cash of %s"%( self._cash, self._solicitor, self._solicitor.money ) )
+
+    def getItems(self):
+        return self._items
+
+    def getTarget(self):
+        return self._target
+
+    def accepted(self):
+        return self._accepted
+
+    def execute( self, board):
+        print( "%s is purchasing %s from %s"%( self._solicitor, self._items, self._target ) )
+        self._solicitor.pay( board, self._target, self._cash )
+        for c in self._items:
+            self._target.dropCard( c )
+            self._solicitor.addCard( c )
+        self._accepted = True
+
+class PlayerPlus(Player):
+    def pre_action(self,board):
+        self.payoff_mortgages(board)
+
+    def payoff_mortgages(self,board):
+        cards_by_income = sorted( self.cards, lambda x,y: x.income>y.income )
+        broken_cards = filter( lambda c: not c.isMonopolized(), cards_by_income )
+        for c in broken_cards:
+            if board.bank.isMortgaged(c):
+                if self.money >= dollars((c.price/2)*1.1):
+                    board.bank.payoff(board,self,c)
+
+    def liquidate(self,board,amt_owned):
+        liquid = 0
+
+        cards_by_income = sorted( self.cards, lambda x,y: x.income>y.income )
+        broken_cards = filter( lambda c: not c.isMonopolized(), cards_by_income )
+
+        # mortgage broken cards
+        for c in reversed( broken_cards ):
+            if not board.bank.isMortgaged(c):
+                amt = board.bank.mortgage( c )
+                liquid += amt
+                self.deposit( amt )
+                if liquid >= amt_owned:
+                    return liquid
+
+        # sell get out of jail cards
+
+        # propose trade
+
+        # sell hotels/houses 
+        for c in cards_by_income:
+            if c.upgrades:
+                c.downgrade()
+                amt = c.block.upgrade_price/2
+                self.deposit( board.bank.withdraw( amt ) )
+                liquid+=amt
+                if liquid >= amt_owned:
+                    return liquid
+
+        return liquid
+
+class AggressivePlayer(PlayerPlus):
+    def __init__(self,name):
+        super(AggressivePlayer,self).__init__(name)
+        self.sentiment = 0
+    def pay(self,board,target,charge):
+        ret = super(AggressivePlayer,self).pay(board,target,charge)
+        self.sentiment -= 1
+        return ret
+    def deposit(self,v):
+        ret = super(AggressivePlayer,self).deposit(v)
+        self.sentiment += 1
+        return ret
+    def post_action(self,board):
+        current_monopolies = self.getMonopolies()
+        for blk in current_monopolies:
+            for c in board.getBlock(blk):
+                if c.canUpgrade() and self.money>=c.block.upgrade_price:
+                    self.pay( board, board.bank, c.block.upgrade_price )
+                    c.upgrade( )
+
+    def proposals(self,board):
+        current_monopolies = self.getMonopolies()
+        for spot in reversed( board.places ):
+            if spot.owner == self:
+                block = [k for k in board.places if (k.block==spot.block)]
+                i_own = [k for k in block if k.owner==self]
+                others = [k for k in block if (k.owner!=self and k.owner) ]
+                if (len(block)==3 and len(i_own) > len(others)) or (len(block)==2 and len(i_own) == len(others)):
+                    grps = groupby( others, lambda k: k.owner )
+                    for owner in grps:
+                        try:
+                            premium = uniform( 1.1, 1.3 + ((1/self.sentiment) if self.sentiment>1 else 0 ) )
+                            c = CashPurchaseContract(self,owner,grps[owner],    
+                                dollars( street_value(grps[owner])*premium ) )
+                            yield c
+                            if c.accepted():
+                                self.sentiment += 1
+                        except RuntimeError as e:
+                            pass
+                        except Exception as e:
+                            log.exception(e)
+        new_monopolies = self.getMonopolies()
+        if len(current_monopolies) < len(new_monopolies):
+            print( "NEW MONOPOLY %s %s" %( current_monopolies, new_monopolies ) )
+        raise StopIteration()
+
+class AggressiveResistentPlayer(AggressivePlayer):
+    def evalulateContract(self,contract):
+        n = len(contract.getItems())
+        l = len(self.cards)
+        if  n / l <= .25:
+            return True
+
+def play():
+    board = setup()
+    p1 = AggressiveResistentPlayer("Ebrahim")
+    board.addPlayer(p1)
+    p2 = AggressiveResistentPlayer("Roman")
+    board.addPlayer(p2)
+    p3 = AggressiveResistentPlayer("Arthur")
+    board.addPlayer(p3)
+    p4 = AggressiveResistentPlayer("Oleg")
+    board.addPlayer(p4)
+
+    m = Monopoly(board)
+    while True:
+        try:
+            m.turn()
+            print(  board  )
+        except StopIteration as e:
+            break
+
+def main():
+    if 0:
+        test()
+    else:
+        play()
+
+def test():
+    test_dice()
+    test_block()
+
+def test_block():
+    board = setup()
+    p1 = AggressivePlayer("Ebrahim")
+    cards = board.getBlock( Block("Light Blue",50) )
+    assert( len(cards)==3 )
+    for c in cards:
+        print( "adding %s" % c )
+        p1.addCard(c)
+        print( "added %s" % c )
+    print( board.getMonopolies() )
+    assert( len(board.getMonopolies())==1 )
+    print( "block tested okay" )
+
+def test_dice():
+    d = Dice()
+    d.history.append( (1,1,) )
+    assert( d.isDouble() )
+    d.history.append(d.history[-1])
+    d.history.append(d.history[-1])
+    assert( d.isThirdDouble() )
+    print( "Dice tested okay" )
+
+main()
